@@ -2,6 +2,7 @@ import Data from "../models/Data.js";
 import User from "../models/User.js";
 import Winner from "../models/Winner.js";
 import TimeSlot from "../models/TimeSlot.js";
+import TimeSlotOverride from "../models/TimeSlotOverride.js";
 
 // Build filter for date + timeSlot/timeSlotId. `date` should be YYYY-MM-DD or Date.
 function buildDateSlotFilter({ date, timeSlot, timeSlotId }) {
@@ -18,6 +19,12 @@ function escapeRegex(input = '') {
     return String(input).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function normalizeDateISO(value) {
+    if (value == null || value === '') return null;
+    const s = String(value).trim();
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
 const addDataForTimeSlot = async (req, res) => {
     const { data, userId: targetUserIdBody, date, timeSlot, timeSlotId } = req.body;
     if (!Array.isArray(data) || data.length === 0) return res.status(400).json({ error: 'data array is required' });
@@ -26,7 +33,17 @@ const addDataForTimeSlot = async (req, res) => {
     try {
         const slotDoc = timeSlotId ? await TimeSlot.findById(timeSlotId) : await TimeSlot.findOne({ label: timeSlot });
         if (!slotDoc) return res.status(404).json({ error: 'TimeSlot not found' });
-        if (!slotDoc.isActive) return res.status(400).json({ error: `TimeSlot '${slotDoc.label}' is not active. Admin must activate it.` });
+
+        // Respect per-date override status first; fallback to base timeslot status.
+        const isoDate = normalizeDateISO(date);
+        let effectiveIsActive = !!slotDoc.isActive;
+        if (isoDate) {
+            const override = await TimeSlotOverride.findOne({ timeSlotId: slotDoc._id, date: isoDate }).lean();
+            if (override) effectiveIsActive = !!override.isActive;
+        }
+        if (!effectiveIsActive) {
+            return res.status(400).json({ error: `TimeSlot '${slotDoc.label}' is not active. Admin must activate it.` });
+        }
 
         const d = (typeof date === 'string') ? new Date(date) : new Date(date);
         d.setHours(0,0,0,0);

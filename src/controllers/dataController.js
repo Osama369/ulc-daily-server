@@ -25,6 +25,66 @@ function normalizeDateISO(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
 }
 
+function getSlotHourMinute(slotDoc) {
+    if (!slotDoc) return null;
+    if (typeof slotDoc.hour === 'number' && !Number.isNaN(slotDoc.hour)) {
+        return { hour24: slotDoc.hour, minute: 0 };
+    }
+
+    const raw = String(slotDoc.label || '').trim();
+    if (!raw) return null;
+
+    const ampm = raw.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
+    if (ampm) {
+        const h = parseInt(ampm[1], 10);
+        const m = parseInt(ampm[2] || '0', 10);
+        const period = String(ampm[3]).toUpperCase();
+        let hour24 = h % 12;
+        if (period === 'PM') hour24 += 12;
+        return { hour24, minute: m };
+    }
+
+    const hhmm = raw.match(/\b(\d{1,2}):(\d{2})\b/);
+    if (hhmm) {
+        return { hour24: parseInt(hhmm[1], 10), minute: parseInt(hhmm[2], 10) };
+    }
+
+    const hOnly = raw.match(/\b(\d{1,2})\b/);
+    if (hOnly) return { hour24: parseInt(hOnly[1], 10), minute: 0 };
+    return null;
+}
+
+function isClosedByTimeForDate(slotDoc, dateISO) {
+    const hm = getSlotHourMinute(slotDoc);
+    if (!hm || !dateISO) return false;
+
+    const [y, m, d] = String(dateISO).split('-').map(Number);
+    if (!y || !m || !d) return false;
+
+    const closeAt = new Date(y, m - 1, d, hm.hour24, hm.minute, 0, 0);
+    // Draw closes 10 minutes before slot time (same convention as frontend).
+    closeAt.setMinutes(closeAt.getMinutes() - 10);
+    return Date.now() >= closeAt.getTime();
+}
+
+async function isSlotClosedForRequest({ date, timeSlot, timeSlotId }) {
+    let slotDoc = null;
+    if (timeSlotId) slotDoc = await TimeSlot.findById(timeSlotId);
+    else if (timeSlot) slotDoc = await TimeSlot.findOne({ label: timeSlot });
+    if (!slotDoc) return false;
+
+    let effectiveIsActive = !!slotDoc.isActive;
+    const isoDate = normalizeDateISO(date);
+    if (isoDate) {
+        const override = await TimeSlotOverride.findOne({ timeSlotId: slotDoc._id, date: isoDate }).lean();
+        if (override) effectiveIsActive = !!override.isActive;
+    }
+
+    if (effectiveIsActive === false) return true;
+    if (isClosedByTimeForDate(slotDoc, isoDate)) return true;
+    return false;
+}
+
 const addDataForTimeSlot = async (req, res) => {
     const { data, userId: targetUserIdBody, date, timeSlot, timeSlotId } = req.body;
     if (!Array.isArray(data) || data.length === 0) return res.status(400).json({ error: 'data array is required' });
@@ -74,10 +134,8 @@ const getDataForDate = async (req, res) => {
     try {
         // If client requested enforcement that the timeslot must be closed before returning data
         if (req.query && req.query.requireClosed === 'true') {
-            let slotDoc = null;
-            if (timeSlotId) slotDoc = await TimeSlot.findById(timeSlotId);
-            else if (timeSlot) slotDoc = await TimeSlot.findOne({ label: timeSlot });
-            if (slotDoc && slotDoc.isActive === true) return res.status(400).json({ error: 'Draw is not close yet' });
+            const isClosed = await isSlotClosedForRequest({ date, timeSlot, timeSlotId });
+            if (!isClosed) return res.status(400).json({ error: 'Draw is not close yet' });
         }
         const filterBase = buildDateSlotFilter({ date, timeSlot, timeSlotId });
         filterBase.userId = req.user.id;
@@ -295,10 +353,8 @@ const getDataForClient = async (req, res) => {
     try {
         // Enforce closed timeslot when requested by client
         if (req.query && req.query.requireClosed === 'true') {
-            let slotDoc = null;
-            if (timeSlotId) slotDoc = await TimeSlot.findById(timeSlotId);
-            else if (timeSlot) slotDoc = await TimeSlot.findOne({ label: timeSlot });
-            if (slotDoc && slotDoc.isActive === true) return res.status(400).json({ error: 'Draw is not close yet' });
+            const isClosed = await isSlotClosedForRequest({ date, timeSlot, timeSlotId });
+            if (!isClosed) return res.status(400).json({ error: 'Draw is not close yet' });
         }
         const filterBase = buildDateSlotFilter({ date, timeSlot, timeSlotId });
         filterBase.userId = userId;
@@ -322,10 +378,8 @@ const getCombinedVoucherData = async (req, res) => {
     try {
         // If client requested enforcement that the timeslot must be closed before returning data
         if (req.query && req.query.requireClosed === 'true') {
-            let slotDoc = null;
-            if (timeSlotId) slotDoc = await TimeSlot.findById(timeSlotId);
-            else if (timeSlot) slotDoc = await TimeSlot.findOne({ label: timeSlot });
-            if (slotDoc && slotDoc.isActive === true) return res.status(400).json({ error: 'Draw is not close yet' });
+            const isClosed = await isSlotClosedForRequest({ date, timeSlot, timeSlotId });
+            if (!isClosed) return res.status(400).json({ error: 'Draw is not close yet' });
         }
         const filter = buildDateSlotFilter({ date, timeSlot, timeSlotId });
         const role = req.user?.role;
@@ -430,6 +484,110 @@ const searchDataByNumber = async (req, res) => {
     }
 };
 
+const searchDistributorCombinedByNumber = async (req, res) => {
+    const { date, timeSlot, timeSlotId, q } = req.query;
+    if (!date) return res.status(400).json({ error: 'date is required' });
+
+    try {
+        if (req.user?.role !== 'admin') {
+            return res.status(403).json({ error: 'Access denied, admin privileges required' });
+        }
+
+        if (req.query && req.query.requireClosed === 'true') {
+            const isClosed = await isSlotClosedForRequest({ date, timeSlot, timeSlotId });
+            if (!isClosed) return res.status(400).json({ error: 'Draw is not close yet' });
+        }
+
+        const filter = buildDateSlotFilter({ date, timeSlot, timeSlotId });
+        const docs = await Data.find(filter).populate('userId', 'username dealerId createdBy role').lean();
+        if (!docs || docs.length === 0) return res.status(200).json({ data: [] });
+
+        const numberNeedle = String(q || '').trim();
+        const hasNeedle = numberNeedle.length > 0;
+
+        const distributorIdSet = new Set();
+        const normalizedRows = [];
+
+        for (const doc of docs) {
+            const owner = doc.userId;
+            if (!owner) continue;
+
+            // If row owner is a distributor itself, keep it; otherwise map via createdBy.
+            const distributorId = owner.role === 'distributor'
+                ? String(owner._id)
+                : (owner.createdBy ? String(owner.createdBy) : null);
+            if (!distributorId) continue;
+
+            distributorIdSet.add(distributorId);
+
+            for (const item of (doc.data || [])) {
+                const no = String(item?.uniqueId || '').trim();
+                if (!no) continue;
+                if (hasNeedle && no !== numberNeedle) continue;
+
+                normalizedRows.push({
+                    distributorId,
+                    number: no,
+                    first: Number(item.firstPrice) || 0,
+                    second: Number(item.secondPrice) || 0,
+                });
+            }
+        }
+
+        if (!normalizedRows.length) return res.status(200).json({ data: [] });
+
+        const distributorIds = Array.from(distributorIdSet);
+        const distributors = await User.find({ _id: { $in: distributorIds } })
+            .select('username dealerId')
+            .lean();
+        const distributorMap = new Map(distributors.map((d) => [String(d._id), d]));
+
+        // Distributor-wise combined values by NO.
+        const combinedMap = new Map();
+        for (const row of normalizedRows) {
+            const key = `${row.distributorId}::${row.number}`;
+            if (!combinedMap.has(key)) {
+                combinedMap.set(key, {
+                    distributorId: row.distributorId,
+                    number: row.number,
+                    first: 0,
+                    second: 0,
+                });
+            }
+            const target = combinedMap.get(key);
+            target.first += row.first;
+            target.second += row.second;
+        }
+
+        const result = Array.from(combinedMap.values()).map((r) => {
+            const dist = distributorMap.get(String(r.distributorId));
+            return {
+                distributorId: r.distributorId,
+                distributorName: dist?.username || '',
+                distributorDealerId: dist?.dealerId || '',
+                number: r.number,
+                first: r.first,
+                second: r.second,
+            };
+        });
+
+        result.sort((a, b) => {
+            const da = `${a.distributorDealerId || ''}`;
+            const db = `${b.distributorDealerId || ''}`;
+            const dcmp = da.localeCompare(db, undefined, { numeric: true, sensitivity: 'base' });
+            if (dcmp !== 0) return dcmp;
+
+            const na = String(a.number || '').replace(/\+/g, '');
+            const nb = String(b.number || '').replace(/\+/g, '');
+            return na.localeCompare(nb, undefined, { numeric: true, sensitivity: 'base' });
+        });
+
+        return res.status(200).json({ data: result });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+};
+
 export {
     addDataForTimeSlot,
     getDataForDate,
@@ -442,6 +600,7 @@ export {
     deleteIndividualEntries,
     getDataForClient,
     getCombinedVoucherData,
-    searchDataByNumber
+    searchDataByNumber,
+    searchDistributorCombinedByNumber
 }
 

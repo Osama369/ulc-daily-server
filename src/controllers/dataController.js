@@ -328,12 +328,37 @@ const getCombinedVoucherData = async (req, res) => {
             if (slotDoc && slotDoc.isActive === true) return res.status(400).json({ error: 'Draw is not close yet' });
         }
         const filter = buildDateSlotFilter({ date, timeSlot, timeSlotId });
+        const role = req.user?.role;
+        const requesterId = String(req.user?.id || '');
 
-        // If requester is a regular user, restrict to their own data
-        if (req.user && req.user.role === 'user') {
-            filter.userId = req.user.id;
+        // Scope data by requester role.
+        if (role === 'user') {
+            // Regular users can only see their own records.
+            filter.userId = requesterId;
+        } else if (role === 'distributor') {
+            // Distributors can only see users/parties created under them.
+            const clientUsers = await User.find({
+                createdBy: requesterId,
+                role: { $in: ['user', 'party'] },
+            }).select('_id');
+            const clientIds = clientUsers.map((u) => u._id);
+
+            if (clientIds.length === 0) {
+                return res.status(200).json({ data: [] });
+            }
+
+            if (userId) {
+                const targetUserId = String(userId);
+                const isOwnClient = clientIds.some((id) => String(id) === targetUserId);
+                if (!isOwnClient) {
+                    return res.status(403).json({ error: 'Unauthorized: selected user is not your client' });
+                }
+                filter.userId = targetUserId;
+            } else {
+                filter.userId = { $in: clientIds };
+            }
         } else if (userId) {
-            // allow explicit userId filter for admins/distributors if provided
+            // Admin (or other privileged role): optional explicit user filter.
             filter.userId = userId;
         }
 
